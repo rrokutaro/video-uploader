@@ -332,7 +332,8 @@ async function downloadDriveFile(auth, fileId, destPath, log) {
     );
 
     await new Promise((resolve, reject) => {
-        res.data.on('end',   resolve);
+        dest.on('finish', resolve);
+        dest.on('error', reject);
         res.data.on('error', reject);
         res.data.pipe(dest);
     });
@@ -634,18 +635,16 @@ async function uploadToFacebook(page, videoPath, metadata, univ, cfg, log) {
     const baseDescription = metadata.description || '';
 
     // Build hashtags from tags: lowercase, strip spaces, prefix with #
+    // NOTE: UNIV tag is intentionally NOT included in FB descriptions — YT only.
     const tags     = Array.isArray(metadata.tags) ? metadata.tags : [];
     const hashtags = tags
         .map(t => '#' + t.toLowerCase().replace(/\s+/g, ''))
         .join(' ');
-    const univTag     = univ ? `UNIV::${univ}` : '';
     const hashAndDesc = [baseDescription, hashtags].filter(Boolean).join('  ');
-    const univLine    = univTag ? `\n\n${univTag}` : '';
-    const maxBody     = 500 - univLine.length;
-    const trimmed     = hashAndDesc.length > maxBody
+    const maxBody     = 500;
+    const description = hashAndDesc.length > maxBody
         ? hashAndDesc.slice(0, maxBody - 1).trimEnd() + '…'
         : hashAndDesc;
-    const description = `${trimmed}${univLine}`;
 
     const videoSize   = fs.statSync(videoPath).size;
 
