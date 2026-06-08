@@ -1,9 +1,8 @@
 # Video Uploader
 
-Automated YouTube upload pipeline. Picks up generated videos from Google Drive,
-deduplicates against live YouTube channels, and uploads on a fair round-robin
-schedule across configs and channels. Runs as a scheduled GitHub Actions job —
-no server to maintain, no babysitting.
+Automated YouTube and Facebook Reels upload pipeline. Picks up generated videos from Google Drive,
+deduplicates against live channels/pages, and uploads on a fair round-robin schedule across configs,
+channels, and pages. Runs as a scheduled GitHub Actions job — no server to maintain, no babysitting.
 
 ---
 
@@ -14,9 +13,10 @@ no server to maintain, no babysitting.
 3. Scans each configured GDrive folder for `.zip` files matching the current config
 4. Sorts candidates by score (highest first)
 5. Scrapes YouTube channels via `yt-dlp` to check if the video is already live (UNIV tag)
-6. Checks min-gap since last upload via **MongoDB Atlas** state (free M0 cluster)
-7. Downloads the zip, extracts it, uploads to YouTube, deletes from Drive
-8. Saves state back to MongoDB — next run continues from where it left off
+6. Checks Facebook pages via Graph API for the same UNIV tag
+7. Checks min-gap since last upload via **MongoDB Atlas** state (free M0 cluster)
+8. Downloads the zip, extracts it, uploads to YouTube and/or Facebook, deletes from Drive
+9. Saves state back to MongoDB — next run continues from where it left off
 
 ---
 
@@ -72,7 +72,7 @@ Example:
 Each zip contains:
 ```
 video.(mp4|mov|mkv|webm)        # required
-thumbnail.(jpg|jpeg|png|webp)   # optional
+thumbnail.(jpg|jpeg|png|webp)   # optional (YouTube only)
 metadata.json                   # required
 ```
 
@@ -80,14 +80,14 @@ metadata.json                   # required
 ```json
 {
   "title": "Video title here",
-  "description": "Video description here\n\nUNIV::d3af9b21c0",
+  "description": "Video description here",
   "tags": ["tag1", "tag2"],
   "categoryId": 22
 }
 ```
 
-> **Important:** The description must end with `\n\nUNIV::<univ_id>`. The server
-> scrapes this tag from YouTube to detect already-uploaded videos and avoid duplicates.
+> **Note:** The UNIV tag is appended automatically by the uploader at publish time —
+> you do not need to include it in `metadata.json`.
 
 ---
 
@@ -102,18 +102,13 @@ Stored in `assets/server-configs/` — one JSON file per niche/config.
   "scheduled_uploads": false,
   "delete_videos_after_uploads": true,
   "max_daily_yt_upload_per_channel": 6,
+  "max_daily_fb_upload_per_page": 3,
 
   "google_drives": [
     {
       "alias": "DRIVE 1",
       "client": "client1.json",
       "token": "token1.json",
-      "folder_id": "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
-    },
-    {
-      "alias": "DRIVE 2",
-      "client": "client2.json",
-      "token": "token2.json",
       "folder_id": "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
     }
   ],
@@ -124,12 +119,14 @@ Stored in `assets/server-configs/` — one JSON file per niche/config.
       "id": "UCxxxxxxxxxxxxxxxxxxxxxxxx",
       "client": "client1.json",
       "token": "token1.json"
-    },
+    }
+  ],
+
+  "facebook_pages": [
     {
-      "name": "channel-slug-2",
-      "id": "UCxxxxxxxxxxxxxxxxxxxxxxxx",
-      "client": "client2.json",
-      "token": "token2.json"
+      "name": "my-page-slug",
+      "id": "123456789012345",
+      "access_token": "EAAxxxxxxx..."
     }
   ]
 }
@@ -141,11 +138,56 @@ Stored in `assets/server-configs/` — one JSON file per niche/config.
 |---|---|
 | `config_id` | Unique string ID — must match the `config_id` segment in zip filenames |
 | `scheduled_upload_delay` | Min ms between uploads (default: 1800000 = 30min) |
-| `scheduled_uploads` | If `true`, uploads as private with a future publish date |
+| `scheduled_uploads` | If `true`, uploads as private with a future publish date (YouTube only) |
 | `delete_videos_after_uploads` | If `true`, deletes zip from Drive after upload |
-| `max_daily_yt_upload_per_channel` | Max uploads per channel per day (default: 6) |
+| `max_daily_yt_upload_per_channel` | Max uploads per YouTube channel per day (default: 6) |
+| `max_daily_fb_upload_per_page` | Max uploads per Facebook page per day (default: matches YT value) |
 | `google_drives` | List of GDrive accounts to scan for zip files |
 | `channels` | List of YouTube channels to upload to (round-robin) |
+| `facebook_pages` | List of Facebook pages to upload Reels to (round-robin) — optional |
+
+> `facebook_pages` is optional. If omitted, the FB pipeline is skipped entirely for that config.
+
+---
+
+## Facebook setup
+
+### Getting a permanent Page Access Token
+
+1. Go to [developers.facebook.com](https://developers.facebook.com) and create a **Business** app
+2. Add the **Pages API** product
+3. Open the **Graph API Explorer**
+4. Request a User Token with these permissions: `pages_manage_posts`, `pages_read_engagement`, `pages_show_list`
+5. Exchange for a long-lived user token:
+   ```
+   GET https://graph.facebook.com/v25.0/oauth/access_token
+     ?grant_type=fb_exchange_token
+     &client_id={APP_ID}
+     &client_secret={APP_SECRET}
+     &fb_exchange_token={SHORT_LIVED_TOKEN}
+   ```
+6. Fetch your pages and their **permanent** page tokens:
+   ```
+   GET https://graph.facebook.com/v25.0/me/accounts
+     ?access_token={LONG_LIVED_USER_TOKEN}
+   ```
+7. Copy each page's `access_token` and `id` into your server config
+
+Page access tokens generated from a long-lived user token **do not expire**.
+
+### Facebook description format
+
+FB Reels do not support tags, so the uploader builds the description automatically:
+
+```
+Your description here  #tag1 #tagwithspaces #anothertag
+
+UNIV::d3af9b21c0
+```
+
+- Tags from `metadata.json` are lowercased, spaces removed, and prefixed with `#`
+- The UNIV tag is always placed on its own line at the end
+- Total description is capped at **500 characters** (excl. UNIV line) to stay within Reels limits
 
 ---
 
@@ -196,7 +238,11 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 
 Go to **Actions → Uploader Server → Run workflow** to trigger a manual run.
 Check the logs to confirm assets are fetched and the pipeline runs correctly.
-Set `UPLOADER_DRY_RUN=true` while testing to avoid real uploads.
+Set `UPLOADER_DRY_RUN=true` while testing — this validates config loading, Drive scanning,
+round-robin logic, and window/gap checks without making any real uploads.
+
+> **Note:** Dry-run does not validate your Facebook access token or test the Graph API.
+> For a real FB token test, do a live run with a single short throwaway video.
 
 ---
 
@@ -275,8 +321,6 @@ UPLOADER_LOOP=true
 MONGODB_URI=mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority
 ```
 
-Here's a section you can drop into both READMEs:
-
 ---
 
 ## Scheduling via cron-job.org (Recommended over GitHub Actions)
@@ -289,11 +333,9 @@ GitHub Actions scheduled workflows are unreliable for frequent intervals — run
 
 Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
 
-- Note: `CloudSurf Runner` (or `Video Uploader`)
+- Note: `Video Uploader`
 - Expiration: No expiration (or your preference)
-- Scopes:
-  - `repo` — required to trigger workflow dispatch
-  - `codespace` — required for CloudSurf Runner only
+- Scopes: `repo`
 
 **2. Create a cron-job.org account**
 
@@ -301,10 +343,8 @@ Go to [cron-job.org](https://cron-job.org) → sign up (free, no credit card)
 
 **3. Create the cronjob**
 
-- **Title:** CloudSurf Runner (or Video Uploader)
-- **URL:**
-  - CloudSurf Runner: `https://api.github.com/repos/<your-username>/CloudSurf-Runner/actions/workflows/main.yml/dispatches`
-  - Video Uploader: `https://api.github.com/repos/<your-username>/video-uploader/actions/workflows/uploader.yml/dispatches`
+- **Title:** Video Uploader
+- **URL:** `https://api.github.com/repos/<your-username>/video-uploader/actions/workflows/uploader.yml/dispatches`
 - **Request method:** `POST`
 - **Request body:**
   ```json
@@ -314,15 +354,13 @@ Go to [cron-job.org](https://cron-job.org) → sign up (free, no credit card)
   - `Authorization` → `Bearer <your PAT>`
   - `Accept` → `application/vnd.github+json`
   - `Content-Type` → `application/json`
-- **Schedule:**
-  - CloudSurf Runner: every 30 minutes — `*/30 * * * *`
-  - Video Uploader: every 15 minutes — `*/15 * * * *`
+- **Schedule:** every 15 minutes — `*/15 * * * *`
 - **Timeout:** 30 seconds
 - **Notifications:** notify after 3 failures
 
 **4. Remove the schedule trigger from your workflow**
 
-Since cron-job.org handles scheduling, remove the `schedule:` block from your `.yml` file to avoid double-triggering. Keep `workflow_dispatch`:
+Since cron-job.org handles scheduling, remove the `schedule:` block from your `.yml` to avoid double-triggering. Keep `workflow_dispatch`:
 
 ```yaml
 on:
@@ -354,3 +392,12 @@ Hit **Run now** on the cron-job.org dashboard. A new `workflow_dispatch` run sho
 
 **`All configs processed — no upload this cycle`**
 → Either min-gap hasn't passed yet, outside upload window, or no zip files found in Drive.
+
+**`FB init failed (400)`**
+→ Page access token is invalid or expired. Re-generate via Graph API Explorer (see Facebook setup above).
+
+**`FB transfer failed`**
+→ Usually a file size or Content-Length mismatch. Check the video file isn't corrupted in the zip.
+
+**FB Reel published but description is truncated**
+→ Expected — description body is capped at 500 chars to comply with Reels limits. UNIV tag is always preserved in full.
