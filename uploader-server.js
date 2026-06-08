@@ -1088,6 +1088,94 @@ async function run(opts, log) {
                 state.channelCursors[configId] = channelIdx;
                 await saveState(state, log);
 
+                // ── Facebook upload (same video, only after YT success) ───────
+                const fbPages     = cfg.facebook_pages || [];
+                const fbPageCount = fbPages.length;
+
+                if (fbPageCount > 0) {
+                    log.info(`FB: attempting upload for same UNIV ${univ} → ${fbPageCount} page(s)`);
+
+                    let fbPageIdx = (state.pageCursors[configId] || 0) % fbPageCount;
+
+                    // ── pick next eligible FB page (respects daily quota) ─────────
+                    const fbDailyLimit = cfg.max_daily_fb_upload_per_page || cfg.max_daily_yt_upload_per_channel || 6;
+                    const fbTodayKey   = new Date().toISOString().slice(0, 10);
+                    let   fbTarget     = null;
+
+                    for (let t = 0; t < fbPageCount; t++) {
+                        const pg       = fbPages[(fbPageIdx + t) % fbPageCount];
+                        const countKey = `__fb_daily__${pg.name}__${fbTodayKey}`;
+                        const count    = state.seenUnivs[countKey] || 0;
+                        if (count < fbDailyLimit) {
+                            fbTarget  = pg;
+                            fbPageIdx = (fbPageIdx + t) % fbPageCount;
+                            break;
+                        }
+                        log.warn(`FB page "${pg.name}" at daily quota (${count}/${fbDailyLimit})`);
+                    }
+
+                    if (!fbTarget) {
+                        log.warn(`All FB pages at daily quota for config ${configId} — skipping FB`);
+                    } else if (!inUploadWindow(opts.window)) {
+                        log.info('Left upload window after YT upload — skipping FB');
+                    } else {
+                        // ── per-page min-gap check ────────────────────────────
+                        const fbMinGap = opts.minGap ?? cfg.scheduled_upload_delay ?? 0;
+                        let   gapOk    = true;
+                        if (fbMinGap > 0) {
+                            const lastUpload = state.pageLastUpload[fbTarget.name] || 0;
+                            const elapsed    = Date.now() - lastUpload;
+                            if (lastUpload > 0 && elapsed < fbMinGap) {
+                                const remaining = Math.ceil((fbMinGap - elapsed) / 60000);
+                                log.info(`FB page "${fbTarget.name}" uploaded ${Math.floor(elapsed / 60000)}min ago — min gap not reached (${remaining}min left). Skipping FB.`);
+                                gapOk = false;
+                            }
+                        }
+
+                        if (gapOk) {
+                            // ── FB dedup: check if page already has this UNIV ─────
+                            let fbAlreadyLive = false;
+                            try {
+                                fbAlreadyLive = await pageAlreadyHasUniv(fbTarget.id, fbTarget.access_token, univ, log);
+                            } catch (e) {
+                                log.warn(`FB dedup check threw for page "${fbTarget.name}": ${e.message} — proceeding`);
+                            }
+
+                            if (fbAlreadyLive) {
+                                log.info(`FB: UNIV ${univ} already on page "${fbTarget.name}" — caching locally`);
+                                state.seenUnivs[`fb::${univ}`] = true;
+                                await saveState(state, log);
+                            } else {
+                                try {
+                                    if (!opts.dryRun) {
+                                        await uploadToFacebook(fbTarget, videoPath, metadata, univ, cfg, log);
+                                    } else {
+                                        log.info(`[DRY RUN] Would upload "${filename}" → FB page "${fbTarget.name}"`);
+                                    }
+
+                                    // ── FB bookkeeping ──────────────────────────
+                                    state.seenUnivs[`fb::${univ}`]      = true;
+                                    state.pageLastUpload[fbTarget.name] = Date.now();
+
+                                    const fbCountKey = `__fb_daily__${fbTarget.name}__${fbTodayKey}`;
+                                    state.seenUnivs[fbCountKey] = (state.seenUnivs[fbCountKey] || 0) + 1;
+
+                                    fbPageIdx = (fbPageIdx + 1) % fbPageCount;
+                                    state.pageCursors[configId] = fbPageIdx;
+                                    await saveState(state, log);
+
+                                    log.success(`✅  FB done — config: ${configId}  page: ${fbTarget.name}  UNIV: ${univ}`);
+                                } catch (e) {
+                                    log.error(`FB upload failed for "${filename}": ${e.message}`);
+                                    if (e.stack) log.debug(e.stack);
+                                    // Non-fatal: YT is the priority; proceed to clean up Drive
+                                }
+                            }
+                        }
+                    }
+                }
+
+
                 // ── delete from Drive ─────────────────────────────────────────
                 if (cfg.delete_videos_after_uploads !== false) {
                     if (!opts.dryRun) {
@@ -1114,118 +1202,6 @@ async function run(opts, log) {
         if (!uploadedThisCycle) {
             log.info(`No upload this cycle for config ${configId}`);
         }
-
-        // ── FACEBOOK PAGES — round-robin Reels upload ─────────────────────────
-        const fbPages     = cfg.facebook_pages || [];
-        const fbPageCount = fbPages.length;
-
-        if (fbPageCount > 0) {
-            log.info(`\n── FB pages for config ${configId}: ${fbPageCount} page(s) ──`);
-
-            let fbPageIdx = (state.pageCursors[configId] || 0) % fbPageCount;
-
-            for (const { driveEntry, driveAuth, fileObj, parsed } of candidates) {
-                const { univ, score, filename } = parsed;
-
-                // skip UNIVs already confirmed uploaded (YT loop may have set this)
-                if (state.seenUnivs[`fb::${univ}`]) {
-                    log.info(`FB: UNIV ${univ} already in local cache — skipping`);
-                    continue;
-                }
-
-                // ── pick next eligible FB page (respects daily quota) ─────────
-                const fbDailyLimit = cfg.max_daily_fb_upload_per_page || cfg.max_daily_yt_upload_per_channel || 6;
-                const todayKey     = new Date().toISOString().slice(0, 10);
-                let   fbTarget     = null;
-
-                for (let t = 0; t < fbPageCount; t++) {
-                    const pg       = fbPages[(fbPageIdx + t) % fbPageCount];
-                    const countKey = `__fb_daily__${pg.name}__${todayKey}`;
-                    const count    = state.seenUnivs[countKey] || 0;
-                    if (count < fbDailyLimit) {
-                        fbTarget  = pg;
-                        fbPageIdx = (fbPageIdx + t) % fbPageCount;
-                        break;
-                    }
-                    log.warn(`FB page "${pg.name}" at daily quota (${count}/${fbDailyLimit})`);
-                }
-
-                if (!fbTarget) {
-                    log.warn(`All FB pages at daily quota for config ${configId} — skipping FB this cycle`);
-                    break;
-                }
-
-                // Re-check upload window
-                if (!inUploadWindow(opts.window)) {
-                    log.info('Left upload window mid-FB-loop — stopping');
-                    break;
-                }
-
-                // ── per-page min-gap check ────────────────────────────────────
-                const fbMinGap = opts.minGap ?? cfg.scheduled_upload_delay ?? 0;
-                if (fbMinGap > 0) {
-                    const lastUpload = state.pageLastUpload[fbTarget.name] || 0;
-                    const elapsed    = Date.now() - lastUpload;
-                    if (lastUpload > 0 && elapsed < fbMinGap) {
-                        const remaining = Math.ceil((fbMinGap - elapsed) / 60000);
-                        log.info(`FB page "${fbTarget.name}" uploaded ${Math.floor(elapsed / 60000)}min ago — min gap ${Math.ceil(fbMinGap / 60000)}min not reached (${remaining}min left). Skipping.`);
-                        continue;
-                    }
-                }
-
-                // ── FB dedup: check if page already has this UNIV ─────────────
-                let fbAlreadyLive = false;
-                try {
-                    fbAlreadyLive = await pageAlreadyHasUniv(fbTarget.id, fbTarget.access_token, univ, log);
-                } catch (e) {
-                    log.warn(`FB dedup check threw for page "${fbTarget.name}": ${e.message} — proceeding`);
-                }
-
-                if (fbAlreadyLive) {
-                    log.info(`FB: UNIV ${univ} already on page "${fbTarget.name}" — caching locally`);
-                    state.seenUnivs[`fb::${univ}`] = true;
-                    await saveState(state, log);
-                    continue;
-                }
-
-                // ── download zip (reuse if already on disk from YT pass) ───────
-                const uid    = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-                const tmpZip = `/tmp/fb_${uid}.zip`;
-                const tmpDir = `/tmp/fb_${uid}`;
-
-                try {
-                    if (!opts.dryRun) {
-                        log.info(`FB: downloading "${filename}" (score ${score.toFixed(2)})...`);
-                        await downloadDriveFile(driveAuth, fileObj.id, tmpZip, log);
-                        const { videoPath, metadata } = extractZip(tmpZip, tmpDir, log);
-                        await uploadToFacebook(fbTarget, videoPath, metadata, univ, cfg, log);
-                    } else {
-                        log.info(`[DRY RUN] Would upload "${filename}" → FB page "${fbTarget.name}"`);
-                    }
-
-                    // ── FB bookkeeping ────────────────────────────────────────
-                    state.seenUnivs[`fb::${univ}`]   = true;
-                    state.pageLastUpload[fbTarget.name] = Date.now();
-
-                    const fbCountKey = `__fb_daily__${fbTarget.name}__${todayKey}`;
-                    state.seenUnivs[fbCountKey] = (state.seenUnivs[fbCountKey] || 0) + 1;
-
-                    fbPageIdx = (fbPageIdx + 1) % fbPageCount;
-                    state.pageCursors[configId] = fbPageIdx;
-                    await saveState(state, log);
-
-                    log.success(`✅  FB done — config: ${configId}  page: ${fbTarget.name}  UNIV: ${univ}`);
-                    break; // one FB upload per config per outer-loop turn
-
-                } catch (e) {
-                    log.error(`FB pipeline failed for "${filename}": ${e.message}`);
-                    if (e.stack) log.debug(e.stack);
-                } finally {
-                    try { fs.rmSync(tmpZip, { force: true }); }                   catch (_) {}
-                    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
-                }
-            } // end FB video loop
-        } // end FB pages block
 
         // Advance config cursor for next run
         configIdx = (configIdx + 1) % configCount;
