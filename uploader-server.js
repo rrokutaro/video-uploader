@@ -42,6 +42,8 @@ const path          = require('path');
 const { spawnSync } = require('child_process');
 const { google }    = require('googleapis');
 const { MongoClient } = require('mongodb');
+const https         = require('https');
+const http          = require('http');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI ARGUMENT PARSING
@@ -178,6 +180,8 @@ const DEFAULT_STATE = () => ({
     configCursor:      0,
     channelCursors:    {},
     channelLastUpload: {},   // { channelName: epochMs } — per-channel last upload time
+    pageCursors:       {},   // { configId: idx } — FB page round-robin
+    pageLastUpload:    {},   // { pageName: epochMs } — per-page last upload time
     seenUnivs:         {},
 });
 
@@ -215,6 +219,8 @@ async function loadState(log) {
                 const { _id, ...state } = doc;
                 // Migrate legacy global lastUploadTime if present
                 if (!state.channelLastUpload) state.channelLastUpload = {};
+                if (!state.pageCursors)       state.pageCursors       = {};
+                if (!state.pageLastUpload)    state.pageLastUpload    = {};
                 return { ...DEFAULT_STATE(), ...state };
             }
             log.info('No existing state in MongoDB — starting fresh.');
@@ -227,6 +233,8 @@ async function loadState(log) {
     if (local) {
         log.info('State loaded from local file.');
         if (!local.channelLastUpload) local.channelLastUpload = {};
+        if (!local.pageCursors)       local.pageCursors       = {};
+        if (!local.pageLastUpload)    local.pageLastUpload    = {};
         return { ...DEFAULT_STATE(), ...local };
     }
     return DEFAULT_STATE();
@@ -475,6 +483,202 @@ async function uploadToYouTube(auth, videoPath, thumbnailPath, metadata, cfg, lo
     }
 
     return response;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FACEBOOK HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Minimal HTTP/HTTPS request helper (no external deps needed).
+ * Returns { statusCode, body } — body is a parsed object if JSON, else raw string.
+ */
+function httpRequest(urlStr, options = {}, bodyData = null) {
+    return new Promise((resolve, reject) => {
+        const url    = new URL(urlStr);
+        const isHttps = url.protocol === 'https:';
+        const lib    = isHttps ? https : http;
+
+        const reqOpts = {
+            hostname: url.hostname,
+            path:     url.pathname + url.search,
+            method:   options.method || 'GET',
+            headers:  options.headers || {},
+        };
+
+        const req = lib.request(reqOpts, res => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const raw = Buffer.concat(chunks).toString();
+                let body;
+                try { body = JSON.parse(raw); } catch { body = raw; }
+                resolve({ statusCode: res.statusCode, body });
+            });
+        });
+
+        req.on('error', reject);
+        if (bodyData) req.write(bodyData);
+        req.end();
+    });
+}
+
+/**
+ * Checks the page's recent videos for UNIV::<univ> in the description.
+ * Uses the Graph API — no yt-dlp needed.
+ * Fails open (returns false) so a failed check never silently blocks an upload.
+ */
+const FB_API_VERSION = 'v25.0';
+
+async function pageAlreadyHasUniv(pageId, accessToken, univ, log) {
+    log.info(`FB: checking page ${pageId} for UNIV::${univ}...`);
+    try {
+        const url = `https://graph.facebook.com/${FB_API_VERSION}/${pageId}/videos`
+            + `?fields=description&limit=50&access_token=${encodeURIComponent(accessToken)}`;
+
+        const { statusCode, body } = await httpRequest(url);
+        if (statusCode !== 200) {
+            log.warn(`FB dedup check HTTP ${statusCode} for page ${pageId} — proceeding anyway`);
+            return false;
+        }
+
+        const needle = `UNIV::${univ}`;
+        const videos = body.data || [];
+        const found  = videos.some(v => (v.description || '').includes(needle));
+        if (found) log.info(`FB: UNIV::${univ} already on page ${pageId}`);
+        return found;
+    } catch (e) {
+        log.warn(`FB dedup check failed for page ${pageId}: ${e.message} — proceeding anyway`);
+        return false;
+    }
+}
+
+/**
+ * Upload a video as a Facebook Reel to a page.
+ *
+ * Flow (resumable upload):
+ *   1. POST /reels/initialize  → upload_session_id + video_id
+ *   2. POST /reels/upload      → binary transfer
+ *   3. POST /reels/finish      → publish
+ *
+ * page.access_token  — permanent page access token (from Graph API Explorer)
+ * page.id            — numeric page ID
+ */
+async function uploadToFacebook(page, videoPath, metadata, univ, cfg, log) {
+    const { id: pageId, access_token: accessToken, name: pageName } = page;
+    const title       = metadata.title       || 'Untitled';
+    const baseDescription = metadata.description || '';
+
+    // Build hashtags from tags: lowercase, strip spaces, prefix with #
+    const tags     = Array.isArray(metadata.tags) ? metadata.tags : [];
+    const hashtags = tags
+        .map(t => '#' + t.toLowerCase().replace(/\s+/g, ''))
+        .join(' ');
+    const univTag     = univ ? `UNIV::${univ}` : '';
+    const hashAndDesc = [baseDescription, hashtags].filter(Boolean).join('  ');
+    const univLine    = univTag ? `\n\n${univTag}` : '';
+    const maxBody     = 500 - univLine.length;
+    const trimmed     = hashAndDesc.length > maxBody
+        ? hashAndDesc.slice(0, maxBody - 1).trimEnd() + '…'
+        : hashAndDesc;
+    const description = `${trimmed}${univLine}`;
+
+    const videoSize   = fs.statSync(videoPath).size;
+
+    log.info(`FB: uploading Reel "${title}" (${(videoSize / 1e6).toFixed(1)} MB) → page "${pageName}" (${pageId})`);
+
+    // ── Step 1: Initialize ────────────────────────────────────────────────────
+    const initUrl  = `https://graph.facebook.com/${FB_API_VERSION}/${pageId}/video_reels`;
+    const initBody = new URLSearchParams({
+        upload_phase:  'start',
+        access_token:  accessToken,
+    }).toString();
+
+    const initRes = await httpRequest(initUrl, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    }, initBody);
+
+    if (initRes.statusCode !== 200) {
+        throw new Error(`FB init failed (${initRes.statusCode}): ${JSON.stringify(initRes.body)}`);
+    }
+
+    const videoId         = initRes.body.video_id;
+    const uploadSessionId = initRes.body.upload_session_id;
+    if (!videoId) {
+        throw new Error(`FB init response missing video_id: ${JSON.stringify(initRes.body)}`);
+    }
+    log.info(`FB: video_id ${videoId}  session ${uploadSessionId}`);
+
+    // ── Step 2: Transfer ──────────────────────────────────────────────────────
+    const transferUrl = `https://rupload.facebook.com/video-upload/${FB_API_VERSION}/${videoId}`;
+    const transferRes = await new Promise((resolve, reject) => {
+        const url = new URL(transferUrl);
+        const req = https.request({
+            hostname: url.hostname,
+            path:     url.pathname + url.search,
+            method:   'POST',
+            headers: {
+                'Authorization':       `OAuth ${accessToken}`,
+                'offset':              '0',
+                'file_size':           String(videoSize),
+                'Content-Type':        'application/octet-stream',
+                'Content-Length':      String(videoSize),
+            },
+        }, res => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const raw = Buffer.concat(chunks).toString();
+                let body;
+                try { body = JSON.parse(raw); } catch { body = raw; }
+                resolve({ statusCode: res.statusCode, body });
+            });
+        });
+        req.on('error', reject);
+
+        // Stream with progress logging
+        let uploaded = 0;
+        let lastLog  = 0;
+        const stream = fs.createReadStream(videoPath);
+        stream.on('data', chunk => {
+            uploaded += chunk.length;
+            const now = Date.now();
+            if (now - lastLog > 15_000) {
+                log.info(`FB upload progress: ${((uploaded / videoSize) * 100).toFixed(0)}%`);
+                lastLog = now;
+            }
+        });
+        stream.on('error', reject);
+        stream.pipe(req);
+    });
+
+    if (transferRes.statusCode !== 200 || !transferRes.body.success) {
+        throw new Error(`FB transfer failed (${transferRes.statusCode}): ${JSON.stringify(transferRes.body)}`);
+    }
+    log.info(`FB: transfer complete`);
+
+    // ── Step 3: Finish / Publish ──────────────────────────────────────────────
+    const finishBody = new URLSearchParams({
+        upload_phase:  'finish',
+        video_id:      videoId,
+        access_token:  accessToken,
+        title,
+        description,
+        video_state:   'PUBLISHED',
+    }).toString();
+
+    const finishRes = await httpRequest(initUrl, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    }, finishBody);
+
+    if (finishRes.statusCode !== 200) {
+        throw new Error(`FB finish failed (${finishRes.statusCode}): ${JSON.stringify(finishRes.body)}`);
+    }
+
+    log.success(`FB: ✅ Reel published — video_id ${videoId}  page "${pageName}"`);
+    return videoId;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -803,6 +1007,118 @@ async function run(opts, log) {
         if (!uploadedThisCycle) {
             log.info(`No upload this cycle for config ${configId}`);
         }
+
+        // ── FACEBOOK PAGES — round-robin Reels upload ─────────────────────────
+        const fbPages     = cfg.facebook_pages || [];
+        const fbPageCount = fbPages.length;
+
+        if (fbPageCount > 0) {
+            log.info(`\n── FB pages for config ${configId}: ${fbPageCount} page(s) ──`);
+
+            let fbPageIdx = (state.pageCursors[configId] || 0) % fbPageCount;
+
+            for (const { driveEntry, driveAuth, fileObj, parsed } of candidates) {
+                const { univ, score, filename } = parsed;
+
+                // skip UNIVs already confirmed uploaded (YT loop may have set this)
+                if (state.seenUnivs[`fb::${univ}`]) {
+                    log.info(`FB: UNIV ${univ} already in local cache — skipping`);
+                    continue;
+                }
+
+                // ── pick next eligible FB page (respects daily quota) ─────────
+                const fbDailyLimit = cfg.max_daily_fb_upload_per_page || cfg.max_daily_yt_upload_per_channel || 6;
+                const todayKey     = new Date().toISOString().slice(0, 10);
+                let   fbTarget     = null;
+
+                for (let t = 0; t < fbPageCount; t++) {
+                    const pg       = fbPages[(fbPageIdx + t) % fbPageCount];
+                    const countKey = `__fb_daily__${pg.name}__${todayKey}`;
+                    const count    = state.seenUnivs[countKey] || 0;
+                    if (count < fbDailyLimit) {
+                        fbTarget  = pg;
+                        fbPageIdx = (fbPageIdx + t) % fbPageCount;
+                        break;
+                    }
+                    log.warn(`FB page "${pg.name}" at daily quota (${count}/${fbDailyLimit})`);
+                }
+
+                if (!fbTarget) {
+                    log.warn(`All FB pages at daily quota for config ${configId} — skipping FB this cycle`);
+                    break;
+                }
+
+                // Re-check upload window
+                if (!inUploadWindow(opts.window)) {
+                    log.info('Left upload window mid-FB-loop — stopping');
+                    break;
+                }
+
+                // ── per-page min-gap check ────────────────────────────────────
+                const fbMinGap = opts.minGap ?? cfg.scheduled_upload_delay ?? 0;
+                if (fbMinGap > 0) {
+                    const lastUpload = state.pageLastUpload[fbTarget.name] || 0;
+                    const elapsed    = Date.now() - lastUpload;
+                    if (lastUpload > 0 && elapsed < fbMinGap) {
+                        const remaining = Math.ceil((fbMinGap - elapsed) / 60000);
+                        log.info(`FB page "${fbTarget.name}" uploaded ${Math.floor(elapsed / 60000)}min ago — min gap ${Math.ceil(fbMinGap / 60000)}min not reached (${remaining}min left). Skipping.`);
+                        continue;
+                    }
+                }
+
+                // ── FB dedup: check if page already has this UNIV ─────────────
+                let fbAlreadyLive = false;
+                try {
+                    fbAlreadyLive = await pageAlreadyHasUniv(fbTarget.id, fbTarget.access_token, univ, log);
+                } catch (e) {
+                    log.warn(`FB dedup check threw for page "${fbTarget.name}": ${e.message} — proceeding`);
+                }
+
+                if (fbAlreadyLive) {
+                    log.info(`FB: UNIV ${univ} already on page "${fbTarget.name}" — caching locally`);
+                    state.seenUnivs[`fb::${univ}`] = true;
+                    await saveState(state, log);
+                    continue;
+                }
+
+                // ── download zip (reuse if already on disk from YT pass) ───────
+                const uid    = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+                const tmpZip = `/tmp/fb_${uid}.zip`;
+                const tmpDir = `/tmp/fb_${uid}`;
+
+                try {
+                    if (!opts.dryRun) {
+                        log.info(`FB: downloading "${filename}" (score ${score.toFixed(2)})...`);
+                        await downloadDriveFile(driveAuth, fileObj.id, tmpZip, log);
+                        const { videoPath, metadata } = extractZip(tmpZip, tmpDir, log);
+                        await uploadToFacebook(fbTarget, videoPath, metadata, univ, cfg, log);
+                    } else {
+                        log.info(`[DRY RUN] Would upload "${filename}" → FB page "${fbTarget.name}"`);
+                    }
+
+                    // ── FB bookkeeping ────────────────────────────────────────
+                    state.seenUnivs[`fb::${univ}`]   = true;
+                    state.pageLastUpload[fbTarget.name] = Date.now();
+
+                    const fbCountKey = `__fb_daily__${fbTarget.name}__${todayKey}`;
+                    state.seenUnivs[fbCountKey] = (state.seenUnivs[fbCountKey] || 0) + 1;
+
+                    fbPageIdx = (fbPageIdx + 1) % fbPageCount;
+                    state.pageCursors[configId] = fbPageIdx;
+                    await saveState(state, log);
+
+                    log.success(`✅  FB done — config: ${configId}  page: ${fbTarget.name}  UNIV: ${univ}`);
+                    break; // one FB upload per config per outer-loop turn
+
+                } catch (e) {
+                    log.error(`FB pipeline failed for "${filename}": ${e.message}`);
+                    if (e.stack) log.debug(e.stack);
+                } finally {
+                    try { fs.rmSync(tmpZip, { force: true }); }                   catch (_) {}
+                    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+                }
+            } // end FB video loop
+        } // end FB pages block
 
         // Advance config cursor for next run
         configIdx = (configIdx + 1) % configCount;
