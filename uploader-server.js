@@ -412,6 +412,54 @@ function extractZip(zipPath, destDir, log) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// UPLOAD LOCATIONS  (US only — used when random_upload_location_feature: true)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const US_UPLOAD_LOCATIONS = [
+    // West
+    { latitude: 34.0522, longitude: -118.2437, locationDescription: 'Los Angeles, USA' },
+    { latitude: 37.7749, longitude: -122.4194, locationDescription: 'San Francisco, USA' },
+    { latitude: 47.6062, longitude: -122.3321, locationDescription: 'Seattle, USA' },
+    { latitude: 32.7157, longitude: -117.1611, locationDescription: 'San Diego, USA' },
+    { latitude: 36.1699, longitude: -115.1398, locationDescription: 'Las Vegas, USA' },
+    { latitude: 33.4484, longitude: -112.0740, locationDescription: 'Phoenix, USA' },
+
+    // East Coast
+    { latitude: 40.7128, longitude:  -74.0060, locationDescription: 'New York, USA' },
+    { latitude: 42.3601, longitude:  -71.0589, locationDescription: 'Boston, USA' },
+    { latitude: 38.9072, longitude:  -77.0369, locationDescription: 'Washington D.C., USA' },
+    { latitude: 39.9526, longitude:  -75.1652, locationDescription: 'Philadelphia, USA' },
+    { latitude: 40.4406, longitude:  -79.9959, locationDescription: 'Pittsburgh, USA' },
+
+    // Midwest
+    { latitude: 41.8781, longitude:  -87.6298, locationDescription: 'Chicago, USA' },
+    { latitude: 39.7684, longitude:  -86.1581, locationDescription: 'Indianapolis, USA' },
+    { latitude: 44.9778, longitude:  -93.2650, locationDescription: 'Minneapolis, USA' },
+    { latitude: 41.2565, longitude:  -95.9345, locationDescription: 'Omaha, USA' },
+    { latitude: 43.0389, longitude:  -87.9065, locationDescription: 'Milwaukee, USA' },
+    { latitude: 39.1031, longitude:  -84.5120, locationDescription: 'Cincinnati, USA' },
+
+    // South
+    { latitude: 29.7604, longitude:  -95.3698, locationDescription: 'Houston, USA' },
+    { latitude: 33.7490, longitude:  -84.3880, locationDescription: 'Atlanta, USA' },
+    { latitude: 32.7767, longitude:  -96.7970, locationDescription: 'Dallas, USA' },
+    { latitude: 25.7617, longitude:  -80.1918, locationDescription: 'Miami, USA' },
+    { latitude: 30.2672, longitude:  -97.7431, locationDescription: 'Austin, USA' },
+    { latitude: 35.2271, longitude:  -80.8431, locationDescription: 'Charlotte, USA' },
+    { latitude: 36.1627, longitude:  -86.7816, locationDescription: 'Nashville, USA' },
+    { latitude: 29.9511, longitude:  -90.0715, locationDescription: 'New Orleans, USA' },
+    { latitude: 35.1495, longitude:  -90.0490, locationDescription: 'Memphis, USA' },
+    { latitude: 27.9506, longitude:  -82.4572, locationDescription: 'Tampa, USA' },
+    { latitude: 28.5383, longitude:  -81.3792, locationDescription: 'Orlando, USA' },
+];
+
+/** Returns a random location from US_UPLOAD_LOCATIONS, or null if the feature is disabled. */
+function pickRandomLocation(cfg) {
+    if (!cfg.random_upload_location_feature) return null;
+    return US_UPLOAD_LOCATIONS[Math.floor(Math.random() * US_UPLOAD_LOCATIONS.length)];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // YOUTUBE UPLOAD
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -427,8 +475,14 @@ async function uploadToYouTube(auth, videoPath, thumbnailPath, metadata, cfg, lo
     const videoSize = fs.statSync(videoPath).size;
     let   lastLog   = 0;
 
+    // ── random upload location ────────────────────────────────────────────────
+    const location = pickRandomLocation(cfg);
+    if (location) {
+        log.info(`YT: using upload location — ${location.locationDescription} (${location.latitude}, ${location.longitude})`);
+    }
+
     const requestParams = {
-        part: 'snippet,status',
+        part: location ? 'snippet,status,recordingDetails' : 'snippet,status',
         requestBody: {
             snippet: {
                 title:                metadata.title        || 'Untitled',
@@ -445,6 +499,16 @@ async function uploadToYouTube(auth, videoPath, thumbnailPath, metadata, cfg, lo
                 publicStatsViewable:     true,
                 ...(publishAt ? { publishAt } : {}),
             },
+            ...(location ? {
+                recordingDetails: {
+                    location: {
+                        latitude:            location.latitude,
+                        longitude:           location.longitude,
+                        altitude:            0,
+                    },
+                    locationDescription: location.locationDescription,
+                },
+            } : {}),
         },
         media: { body: fs.createReadStream(videoPath) },
     };
@@ -659,14 +723,45 @@ async function uploadToFacebook(page, videoPath, metadata, univ, cfg, log) {
     log.info(`FB: transfer complete`);
 
     // ── Step 3: Finish / Publish ──────────────────────────────────────────────
-    const finishBody = new URLSearchParams({
+    // ── optional: look up a Facebook Place ID near the chosen location ────────
+    const fbLocation = pickRandomLocation(cfg);
+    let   fbPlaceId  = null;
+
+    if (fbLocation) {
+        log.info(`FB: looking up place near ${fbLocation.locationDescription} (${fbLocation.latitude}, ${fbLocation.longitude})...`);
+        try {
+            const placeUrl = `https://graph.facebook.com/${FB_API_VERSION}/search`
+                + `?type=place`
+                + `&center=${fbLocation.latitude},${fbLocation.longitude}`
+                + `&distance=5000`
+                + `&limit=1`
+                + `&fields=id,name`
+                + `&access_token=${encodeURIComponent(accessToken)}`;
+
+            const placeRes = await httpRequest(placeUrl);
+            const places   = placeRes.body && placeRes.body.data;
+            if (Array.isArray(places) && places.length > 0) {
+                fbPlaceId = places[0].id;
+                log.info(`FB: place found — "${places[0].name}" (id: ${fbPlaceId})`);
+            } else {
+                log.warn(`FB: no place found near ${fbLocation.locationDescription} — uploading without location tag`);
+            }
+        } catch (e) {
+            log.warn(`FB: place lookup failed (non-fatal): ${e.message} — uploading without location tag`);
+        }
+    }
+
+    const finishParams = {
         upload_phase:  'finish',
         video_id:      videoId,
         access_token:  accessToken,
         title,
         description,
         video_state:   'PUBLISHED',
-    }).toString();
+        ...(fbPlaceId ? { place: fbPlaceId } : {}),
+    };
+
+    const finishBody = new URLSearchParams(finishParams).toString();
 
     const finishRes = await httpRequest(initUrl, {
         method:  'POST',
