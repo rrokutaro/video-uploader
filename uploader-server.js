@@ -356,12 +356,12 @@ async function deleteDriveFile(auth, fileId, log) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Returns true if  UNIV::<univ>  appears in any of the channel's most recent
- * `limit` video descriptions.
- * Fails open (returns false) so a scrape error never silently blocks an upload.
+ * Fetches the last `limit` video descriptions from a channel and returns
+ * a Set of all UNIV hashes found. Runs once per channel per config cycle.
+ * Fails open (returns empty Set) so a scrape error never blocks an upload.
  */
-function channelAlreadyHasUniv(channelId, univ, limit, log) {
-    log.info(`Scraping channel ${channelId} for UNIV::${univ} (last ${limit} videos)...`);
+function scrapeChannelUnivs(channelId, limit, log) {
+    log.info(`Scraping channel ${channelId} (last ${limit} videos)...`);
 
     const result = spawnSync('yt-dlp', [
         `https://www.youtube.com/channel/${channelId}/videos`,
@@ -374,13 +374,29 @@ function channelAlreadyHasUniv(channelId, univ, limit, log) {
 
     if (result.error) {
         log.warn(`yt-dlp spawn error for channel ${channelId}: ${result.error.message}`);
-        return false;
+        return new Set();
     }
 
-    const needle = `UNIV::${univ}`;
-    const found  = (result.stdout || '').includes(needle);
-    if (found) log.info(`UNIV::${univ} already present in channel ${channelId}`);
+    const found = new Set();
+    const text  = result.stdout || '';
+    for (const m of text.matchAll(/UNIV::([a-f0-9]+)/g)) {
+        found.add(m[1]);
+    }
+    log.info(`Channel ${channelId}: found ${found.size} UNIV(s) in last ${limit} videos`);
     return found;
+}
+
+/**
+ * Scrapes all channels for a config in parallel and returns a combined Set
+ * of all UNIV hashes already live across any channel in that config.
+ */
+async function scrapeAllChannels(channels, limit, log) {
+    const results = await Promise.all(
+        channels.map(ch => Promise.resolve(scrapeChannelUnivs(ch.id, limit, log)))
+    );
+    const combined = new Set();
+    for (const s of results) for (const univ of s) combined.add(univ);
+    return combined;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -948,6 +964,10 @@ async function run(opts, log) {
         // ── per-channel min-gap is enforced at upload time (see below) ─────────
         const minGap = opts.minGap ?? cfg.scheduled_upload_delay ?? 0;
 
+        // ── scrape all channels once in parallel before the video loop ────────
+        log.info(`Scraping ${channels.length} channel(s) for config ${configId}...`);
+        const liveUnivs = await scrapeAllChannels(channels, SCRAPE_LIMIT, log);
+
         // ── video loop ────────────────────────────────────────────────────────
         let uploadedThisCycle = false;
 
@@ -960,15 +980,8 @@ async function run(opts, log) {
                 continue;
             }
 
-            // ── scrape every channel in this config for the UNIV tag ──────────
-            // (Any channel might have received it from a previous run or server.)
-            let alreadyLive = false;
-            for (const ch of channels) {
-                if (channelAlreadyHasUniv(ch.id, univ, SCRAPE_LIMIT, log)) {
-                    alreadyLive = true;
-                    break;
-                }
-            }
+            // ── check pre-scraped channel results (no extra yt-dlp calls) ─────
+            const alreadyLive = liveUnivs.has(univ);
 
             if (alreadyLive) {
                 log.info(`UNIV ${univ} already live — caching locally + removing from Drive`);
