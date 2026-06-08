@@ -733,7 +733,7 @@ function refetchAssets(log) {
 // MAIN LOOP
 // ─────────────────────────────────────────────────────────────────────────────
 async function run(opts, log) {
-    const SCRAPE_LIMIT = 20;
+    const SCRAPE_LIMIT = 6;
 
     let state = await loadState(log);
     let lastRefetch = 0;
