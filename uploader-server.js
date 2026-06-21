@@ -996,7 +996,7 @@ async function run(opts, log) {
                 continue;
             }
 
-            // ── pick next eligible channel (respects daily quota) ─────────────
+            // ── pick next eligible channel (respects daily quota AND min-gap) ──
             const dailyLimit = cfg.max_daily_yt_upload_per_channel || 6;
             const todayKey   = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
             let   target     = null;
@@ -1005,16 +1005,26 @@ async function run(opts, log) {
                 const ch       = channels[(channelIdx + t) % channelCount];
                 const countKey = `__daily__${ch.name}__${todayKey}`;
                 const count    = state.seenUnivs[countKey] || 0;
-                if (count < dailyLimit) {
-                    target     = ch;
-                    channelIdx = (channelIdx + t) % channelCount;
-                    break;
+                if (count >= dailyLimit) {
+                    log.warn(`Channel "${ch.name}" at daily quota (${count}/${dailyLimit})`);
+                    continue;
                 }
-                log.warn(`Channel "${ch.name}" at daily quota (${count}/${dailyLimit})`);
+                if (minGap > 0) {
+                    const lastUpload = state.channelLastUpload[ch.name] || 0;
+                    const elapsed    = Date.now() - lastUpload;
+                    if (lastUpload > 0 && elapsed < minGap) {
+                        const remaining = Math.ceil((minGap - elapsed) / 60000);
+                        log.info(`Channel "${ch.name}" uploaded ${Math.floor(elapsed / 60000)}min ago — min gap ${Math.ceil(minGap / 60000)}min not reached (${remaining}min left). Trying next channel.`);
+                        continue;
+                    }
+                }
+                target     = ch;
+                channelIdx = (channelIdx + t) % channelCount;
+                break;
             }
 
             if (!target) {
-                log.warn(`All channels at daily quota for config ${configId} — stopping this cycle`);
+                log.warn(`No eligible channel for config ${configId} (all at quota or within min-gap) — stopping this cycle`);
                 break;
             }
 
@@ -1022,17 +1032,6 @@ async function run(opts, log) {
             if (!inUploadWindow(opts.window)) {
                 log.info('Left upload window mid-loop — stopping');
                 break;
-            }
-
-            // ── per-channel min-gap check ─────────────────────────────────────
-            if (minGap > 0) {
-                const lastUpload = state.channelLastUpload[target.name] || 0;
-                const elapsed    = Date.now() - lastUpload;
-                if (lastUpload > 0 && elapsed < minGap) {
-                    const remaining = Math.ceil((minGap - elapsed) / 60000);
-                    log.info(`Channel "${target.name}" uploaded ${Math.floor(elapsed / 60000)}min ago — min gap ${Math.ceil(minGap / 60000)}min not reached (${remaining}min left). Skipping.`);
-                    continue;
-                }
             }
 
             // ── download zip ──────────────────────────────────────────────────
