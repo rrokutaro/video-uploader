@@ -1199,26 +1199,18 @@ async function run(opts, log) {
             }
         } // end video loop
 
-        if (uploadedThisCycle) {
-            // One successful upload = one YouTube account per IP.
-            // Advance cursor so the NEXT run starts on the next config, then stop.
-            configIdx = (configIdx + 1) % configCount;
-            state.configCursor = configIdx;
-            await saveState(state, log);
-            log.info(`Upload successful for config ${configId} — exiting to preserve IP rotation.`);
-            break;
+        if (!uploadedThisCycle) {
+            log.info(`No upload this cycle for config ${configId}`);
         }
 
-        // Nothing uploaded for this config (quota, gap, no videos, error, etc.)
-        // Advance cursor and try the next config in this same run.
-        log.info(`No upload this cycle for config ${configId} — trying next config...`);
+        // Advance config cursor for next run
         configIdx = (configIdx + 1) % configCount;
         state.configCursor = configIdx;
         await saveState(state, log);
 
     } // end config loop
 
-    log.info('Run complete.');
+    log.info('All configs processed for this run.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
