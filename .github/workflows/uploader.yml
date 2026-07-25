@@ -9,14 +9,12 @@ jobs:
     timeout-minutes: 10
 
     env:
-      MONGODB_URI:              ${{ secrets.MONGODB_URI }}
-      GDRIVE_SERVER_CONFIGS_ID: ${{ secrets.GDRIVE_SERVER_CONFIGS_ID }}
-      GDRIVE_CLIENT_SECRETS_ID: ${{ secrets.GDRIVE_CLIENT_SECRETS_ID }}
-      GDRIVE_CLIENT_TOKENS_ID:  ${{ secrets.GDRIVE_CLIENT_TOKENS_ID }}
-      UPLOADER_CONFIGS:         ${{ secrets.UPLOADER_CONFIGS }}
-      UPLOADER_MIN_GAP:         ${{ secrets.UPLOADER_MIN_GAP }}
-      UPLOADER_WINDOW:          ${{ secrets.UPLOADER_WINDOW }}
-      UPLOADER_DRY_RUN:         ${{ secrets.UPLOADER_DRY_RUN }}
+      MONGODB_URI:      ${{ secrets.MONGODB_URI }}
+      HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+      UPLOADER_CONFIGS: ${{ secrets.UPLOADER_CONFIGS }}
+      UPLOADER_MIN_GAP: ${{ secrets.UPLOADER_MIN_GAP }}
+      UPLOADER_WINDOW:  ${{ secrets.UPLOADER_WINDOW }}
+      UPLOADER_DRY_RUN: ${{ secrets.UPLOADER_DRY_RUN }}
 
     steps:
       - name: Checkout
@@ -31,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq python3 python3-pip unzip
-          pip3 install --upgrade "yt-dlp[default]" gdown --break-system-packages
+          pip3 install --upgrade "yt-dlp[default]" --break-system-packages
 
       - name: Install npm deps
         run: npm install
