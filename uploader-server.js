@@ -338,6 +338,20 @@ async function downloadDriveFile(auth, fileId, destPath, log) {
         res.data.pipe(dest);
     });
 
+    // Validate the downloaded file is a real zip. The Drive API can return HTTP 200
+    // with an HTML error body when hitting quota or sharing permission issues.
+    const stat = fs.statSync(destPath);
+    if (stat.size < 1000) {
+        throw new Error(`Downloaded file too small (${stat.size} bytes) — likely a Drive error page, not a zip`);
+    }
+    const magic = Buffer.alloc(4);
+    const magicFd = fs.openSync(destPath, 'r');
+    fs.readSync(magicFd, magic, 0, 4, 0);
+    fs.closeSync(magicFd);
+    if (magic.toString('hex') !== '504b0304') {
+        throw new Error(`Downloaded file is not a zip (magic: ${magic.toString('hex')}) — Drive quota or permissions issue`);
+    }
+
     log.info(`Downloaded ${fileId} → ${destPath}`);
 }
 
@@ -792,14 +806,78 @@ async function uploadToFacebook(page, videoPath, metadata, univ, cfg, log) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ASSET RE-FETCH  (mirrors gdown logic from on-start-script.sh)
+// ASSET RE-FETCH  (downloads from HuggingFace dataset via bearer token)
 // Runs at startup and every `refetchInterval` seconds thereafter.
+//
+// Required env var: HF_TOKEN  — HuggingFace read token (add as GitHub Secret)
+// HF dataset:       rrokutaro/secrets-k7m-cl  (private)
+// Files expected:   server-configs.zip, client-secrets.zip, client-tokens.zip
 // ─────────────────────────────────────────────────────────────────────────────
-function refetchAssets(log) {
+
+/**
+ * Download a single file from a private HuggingFace dataset to destPath.
+ * Uses the HF hub resolve URL with Authorization: Bearer <HF_TOKEN>.
+ * Follows redirects (HF returns a 302 to the actual blob storage URL).
+ */
+function downloadHFFile(hfUrl, destPath, hfToken) {
+    return new Promise((resolve, reject) => {
+        function doRequest(url, redirectsLeft) {
+            if (redirectsLeft < 0) return reject(new Error(`Too many redirects for ${url}`));
+
+            const parsedUrl = new URL(url);
+            const isHttps   = parsedUrl.protocol === 'https:';
+            const lib       = isHttps ? https : http;
+
+            const reqOpts = {
+                hostname: parsedUrl.hostname,
+                path:     parsedUrl.pathname + parsedUrl.search,
+                method:   'GET',
+                headers:  { 'Authorization': `Bearer ${hfToken}` },
+            };
+
+            const req = lib.request(reqOpts, res => {
+                // Follow redirects (301, 302, 307, 308)
+                if ([301, 302, 307, 308].includes(res.statusCode)) {
+                    const location = res.headers['location'];
+                    if (!location) return reject(new Error(`Redirect with no Location header from ${url}`));
+                    // Consume response body to free socket
+                    res.resume();
+                    return doRequest(location, redirectsLeft - 1);
+                }
+
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    return reject(new Error(`HF download HTTP ${res.statusCode} for ${url}`));
+                }
+
+                const dest = fs.createWriteStream(destPath);
+                dest.on('finish', resolve);
+                dest.on('error', reject);
+                res.on('error', reject);
+                res.pipe(dest);
+            });
+
+            req.on('error', reject);
+            req.end();
+        }
+
+        doRequest(hfUrl, 10);
+    });
+}
+
+async function refetchAssets(log) {
+    const hfToken = process.env.HF_TOKEN;
+    if (!hfToken) {
+        log.error('HF_TOKEN env var not set — cannot fetch assets — aborting');
+        process.exit(1);
+    }
+
+    const HF_BASE = 'https://huggingface.co/datasets/rrokutaro/secrets-k7m-cl/resolve/main';
+
     const tasks = [
-        { envId: 'GDRIVE_SERVER_CONFIGS_ID', dest: 'assets/server-configs', skipEnv: 'DISABLE_SERVER_CONFIGS_FETCH' },
-        { envId: 'GDRIVE_CLIENT_SECRETS_ID', dest: 'assets/client-secrets', skipEnv: 'DISABLE_CLIENT_SECRETS_FETCH' },
-        { envId: 'GDRIVE_CLIENT_TOKENS_ID',  dest: 'assets/client-tokens',  skipEnv: 'DISABLE_CLIENT_TOKENS_FETCH'  },
+        { hfFile: 'server-configs.zip', dest: 'assets/server-configs', skipEnv: 'DISABLE_SERVER_CONFIGS_FETCH' },
+        { hfFile: 'client-secrets.zip', dest: 'assets/client-secrets', skipEnv: 'DISABLE_CLIENT_SECRETS_FETCH' },
+        { hfFile: 'client-tokens.zip',  dest: 'assets/client-tokens',  skipEnv: 'DISABLE_CLIENT_TOKENS_FETCH'  },
     ];
 
     for (const t of tasks) {
@@ -807,34 +885,52 @@ function refetchAssets(log) {
             log.info(`Skipping re-fetch of ${t.dest} (${t.skipEnv}=true)`);
             continue;
         }
-        const fileId = process.env[t.envId];
-        if (!fileId) {
-            log.warn(`${t.envId} not set — skipping re-fetch of ${t.dest}`);
-            continue;
-        }
 
         const tmpZip = `/tmp/refetch_${Date.now()}_${Math.random().toString(36).slice(2)}.zip`;
         try {
-            log.info(`Re-fetching ${t.dest} (GDrive ${fileId})...`);
-            const dl = spawnSync('gdown', [
-                `https://drive.google.com/uc?id=${fileId}`,
-                '-O', tmpZip,
-                '--quiet',
-            ], { encoding: 'utf8', timeout: 120_000 });
+            const url = `${HF_BASE}/${t.hfFile}`;
+            log.info(`Re-fetching ${t.dest} from HuggingFace (${t.hfFile})...`);
 
-            if (dl.status !== 0 || !fs.existsSync(tmpZip)) {
-                log.warn(`gdown failed for ${t.dest}: ${(dl.stderr || '').trim()}`);
-                continue;
+            await downloadHFFile(url, tmpZip, hfToken);
+
+            // Validate it's actually a zip — guard against any unexpected response body
+            const stat = fs.statSync(tmpZip);
+            if (stat.size < 100) {
+                log.error(`HF download for ${t.dest} returned a suspiciously small file (${stat.size} bytes) — aborting`);
+                try { fs.rmSync(tmpZip, { force: true }); } catch (_) {}
+                process.exit(1);
+            }
+
+            const magic   = Buffer.alloc(4);
+            const magicFd = fs.openSync(tmpZip, 'r');
+            fs.readSync(magicFd, magic, 0, 4, 0);
+            fs.closeSync(magicFd);
+            if (magic.toString('hex') !== '504b0304') {
+                log.error(`HF download for ${t.dest} is not a zip (magic: ${magic.toString('hex')}) — aborting`);
+                try { fs.rmSync(tmpZip, { force: true }); } catch (_) {}
+                process.exit(1);
+            }
+
+            // Unzip into a temp dir first, then atomically swap — never wipe
+            // existing assets until we know the new unzip succeeded.
+            const tmpUnpack = `${t.dest}_unpack_${Date.now()}`;
+            fs.mkdirSync(tmpUnpack, { recursive: true });
+            const unzipRes = spawnSync('unzip', ['-q', '-o', tmpZip, '-d', tmpUnpack], { encoding: 'utf8' });
+            fs.rmSync(tmpZip, { force: true });
+
+            if (unzipRes.status !== 0) {
+                log.error(`unzip failed for ${t.dest}: ${(unzipRes.stderr || '').trim()} — aborting`);
+                try { fs.rmSync(tmpUnpack, { recursive: true, force: true }); } catch (_) {}
+                process.exit(1);
             }
 
             fs.rmSync(t.dest, { recursive: true, force: true });
-            fs.mkdirSync(t.dest, { recursive: true });
-            spawnSync('unzip', ['-q', '-o', tmpZip, '-d', t.dest], { encoding: 'utf8' });
-            fs.rmSync(tmpZip, { force: true });
+            fs.renameSync(tmpUnpack, t.dest);
             log.success(`Re-fetched ${t.dest}`);
         } catch (e) {
-            log.error(`Re-fetch error for ${t.dest}: ${e.message}`);
+            log.error(`Re-fetch error for ${t.dest}: ${e.message} — aborting`);
             try { fs.rmSync(tmpZip, { force: true }); } catch (_) {}
+            process.exit(1);
         }
     }
 }
@@ -850,7 +946,7 @@ async function run(opts, log) {
 
     async function maybeRefetch() {
         if (Date.now() - lastRefetch >= opts.refetchInterval * 1000) {
-            refetchAssets(log);
+            await refetchAssets(log);
             lastRefetch = Date.now();
         }
     }
